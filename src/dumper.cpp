@@ -61,14 +61,28 @@ static jmethodID g_jmid_fldType = nullptr;
 static jclass    g_jcls_Method  = nullptr;
 static jmethodID g_jmid_mthName = nullptr;
 
-static jmethodID g_jmid_fldMods      = nullptr; 
-static jmethodID g_jmid_classTypeName= nullptr; 
-static jmethodID g_jmid_mthRet       = nullptr; 
-static jmethodID g_jmid_mthParams    = nullptr; 
-static jmethodID g_jmid_mthMods      = nullptr; 
-static jobject   g_unsafe            = nullptr; 
-static jmethodID g_jmid_unsafeOFO   = nullptr; 
-static jmethodID g_jmid_unsafeSFO   = nullptr; 
+static jmethodID g_jmid_fldMods      = nullptr;
+static jmethodID g_jmid_classTypeName= nullptr;
+static jmethodID g_jmid_mthRet       = nullptr;
+static jmethodID g_jmid_mthParams    = nullptr;
+static jmethodID g_jmid_mthMods      = nullptr;
+static jobject   g_unsafe            = nullptr;
+static jmethodID g_jmid_unsafeOFO   = nullptr;
+static jmethodID g_jmid_unsafeSFO   = nullptr;
+
+static jmethodID g_jmid_classMods        = nullptr;
+static jmethodID g_jmid_getSuperclass    = nullptr;
+static jmethodID g_jmid_getInterfaces    = nullptr;
+static jmethodID g_jmid_isInterface      = nullptr;
+static jmethodID g_jmid_isEnum           = nullptr;
+static jmethodID g_jmid_isAnnotation     = nullptr;
+static jmethodID g_jmid_getAnnotations   = nullptr;
+static jmethodID g_jmid_annoTypeName     = nullptr;
+static jmethodID g_jmid_mthExcTypes      = nullptr;
+static jmethodID g_jmid_getDeclaredCtors = nullptr;
+static jclass    g_jcls_Constructor      = nullptr;
+static jmethodID g_jmid_ctorParams       = nullptr;
+static jmethodID g_jmid_ctorMods         = nullptr;
 
 static FILE*  g_file     = nullptr;
 static FILE*  g_fmt_file = nullptr;   
@@ -220,6 +234,42 @@ static bool init_jni_reflection(JNIEnv* env){
             g_unsafe ? "+" : "!", g_unsafe ? "OK" : "FAIL (offsets disabled)");
     }
 
+    if(g_jcls_Class){
+        g_jmid_classMods     = raw_GetMethodID(env, g_jcls_Class, "getModifiers",    "()I");
+        g_jmid_getSuperclass = raw_GetMethodID(env, g_jcls_Class, "getSuperclass",   "()Ljava/lang/Class;");
+        g_jmid_getInterfaces = raw_GetMethodID(env, g_jcls_Class, "getInterfaces",   "()[Ljava/lang/Class;");
+        g_jmid_isInterface   = raw_GetMethodID(env, g_jcls_Class, "isInterface",     "()Z");
+        g_jmid_isEnum        = raw_GetMethodID(env, g_jcls_Class, "isEnum",          "()Z");
+        g_jmid_isAnnotation  = raw_GetMethodID(env, g_jcls_Class, "isAnnotation",    "()Z");
+        g_jmid_getAnnotations= raw_GetMethodID(env, g_jcls_Class, "getDeclaredAnnotations", "()[Ljava/lang/annotation/Annotation;");
+        g_jmid_getDeclaredCtors = raw_GetMethodID(env, g_jcls_Class, "getDeclaredConstructors", "()[Ljava/lang/reflect/Constructor;");
+        raw_ExceptionClear(env);
+    }
+    if(g_jcls_Method){
+        g_jmid_mthExcTypes = raw_GetMethodID(env, g_jcls_Method, "getExceptionTypes", "()[Ljava/lang/Class;");
+        raw_ExceptionClear(env);
+    }
+    {
+        jclass cls_anno = raw_FindClass(env, "java/lang/annotation/Annotation");
+        raw_ExceptionClear(env);
+        if(cls_anno){
+            g_jmid_annoTypeName = raw_GetMethodID(env, cls_anno, "annotationType", "()Ljava/lang/Class;");
+            raw_ExceptionClear(env);
+            raw_DeleteLocalRef(env, cls_anno);
+        }
+    }
+    {
+        jclass cls_ctor = raw_FindClass(env, "java/lang/reflect/Constructor");
+        raw_ExceptionClear(env);
+        if(cls_ctor){
+            g_jcls_Constructor = (jclass)raw_NewGlobalRef(env, cls_ctor);
+            raw_DeleteLocalRef(env, cls_ctor);
+            g_jmid_ctorParams = raw_GetMethodID(env, g_jcls_Constructor, "getParameterTypes", "()[Ljava/lang/Class;");
+            g_jmid_ctorMods   = raw_GetMethodID(env, g_jcls_Constructor, "getModifiers",      "()I");
+            raw_ExceptionClear(env);
+        }
+    }
+
     return true;
 }
 
@@ -249,15 +299,234 @@ static std::string get_type_name(JNIEnv* env, jobject cls){
     return "?";
 }
 
+
+static std::string str_contains(const std::string& s, const char* sub){
+    return s.find(sub) != std::string::npos ? sub : "";
+}
+static bool icontains(const std::string& s, const char* sub){
+    std::string lo = s, lsub = sub;
+    for(auto& c:lo)  c=(char)tolower((unsigned char)c);
+    for(auto& c:lsub)c=(char)tolower((unsigned char)c);
+    return lo.find(lsub) != std::string::npos;
+}
+
+static std::string decode_access(jint m){
+    if(m & 0x1) return "public";
+    if(m & 0x2) return "private";
+    if(m & 0x4) return "protected";
+    return "package";
+}
+
+static std::string field_semantic_tags(const std::string& name, const std::string& type, jint mods){
+    std::string t;
+    if(mods & 0x10) t += " [final]";
+    if(mods & 0x40) t += " [volatile]";
+    if(mods & 0x80) t += " [transient]";
+    if(icontains(name,"posX")||icontains(name,"posY")||icontains(name,"posZ")||name=="x"||name=="y"||name=="z")
+        t += " [position]";
+    else if(icontains(name,"yaw")||icontains(name,"pitch")||icontains(name,"rotation"))
+        t += " [rotation]";
+    else if(icontains(name,"health")||icontains(name,"maxHealth"))
+        t += " [health]";
+    else if(icontains(name,"speed")||icontains(name,"velocity"))
+        t += " [velocity]";
+    else if(icontains(name,"width")||icontains(name,"height")||icontains(name,"depth"))
+        t += " [dimensions]";
+    else if(type=="boolean"||type=="java.lang.Boolean")
+        t += " [flag]";
+    if(icontains(type,"List")||icontains(type,"ArrayList")||icontains(type,"Set"))
+        t += " [collection]";
+    if(icontains(type,"Map")||icontains(type,"HashMap")||icontains(type,"ConcurrentHashMap"))
+        t += " [map]";
+    if(icontains(type,"String")) t += " [string]";
+    if(icontains(type,"Thread")) t += " [thread-ref]";
+    if(icontains(name,"render")||icontains(name,"texture")||icontains(name,"shader"))
+        t += " [render-data]";
+    if(icontains(name,"entity")||icontains(name,"player")||icontains(name,"mob"))
+        t += " [entity-ref]";
+    if(icontains(name,"world")||icontains(name,"chunk")||icontains(name,"block"))
+        t += " [world-ref]";
+    if(icontains(name,"packet")||icontains(name,"socket")||icontains(name,"network"))
+        t += " [network-ref]";
+    if(icontains(name,"timer")||icontains(name,"tick")||icontains(name,"counter"))
+        t += " [timer]";
+    if(icontains(name,"debug")||icontains(name,"log")||icontains(name,"trace"))
+        t += " [debug]";
+    if(name=="INSTANCE"||icontains(name,"instance")||name=="theMinecraft"||name=="mc")
+        t += " [singleton]";
+    return t;
+}
+
+static std::string method_semantic_tags(const std::string& name, const std::string& ret, jint mods){
+    std::string t;
+    if(mods & 0x400) t += " [abstract]";
+    if(mods & 0x100) t += " [native]";
+    if(mods & 0x020) t += " [synchronized]";
+    if(mods & 0x010) t += " [final]";
+    size_t nl = name.size();
+    const char* n = name.c_str();
+    if(nl>3 && name.substr(0,3)=="get" && isupper((unsigned char)n[3])) t += " [getter]";
+    else if(nl>3 && name.substr(0,3)=="set" && isupper((unsigned char)n[3])) t += " [setter]";
+    else if(nl>2 && name.substr(0,2)=="is"  && isupper((unsigned char)n[2])) t += " [bool-check]";
+    else if(nl>3 && name.substr(0,3)=="has" && isupper((unsigned char)n[3])) t += " [bool-check]";
+    else if(nl>2 && name.substr(0,2)=="on"  && isupper((unsigned char)n[2])) t += " [event-handler]";
+    if(icontains(name,"tick")||icontains(name,"update")||name=="onUpdate"||name=="onLivingUpdate") t += " [tick]";
+    if(icontains(name,"render")||icontains(name,"draw")||icontains(name,"paint")) t += " [render]";
+    if(icontains(name,"init")||icontains(name,"setup")||icontains(name,"load")||icontains(name,"start")) t += " [init]";
+    if(icontains(name,"destroy")||icontains(name,"cleanup")||icontains(name,"dispose")||icontains(name,"close")) t += " [cleanup]";
+    if(icontains(name,"send")||icontains(name,"receive")||icontains(name,"packet")||icontains(name,"network")) t += " [network]";
+    if(icontains(name,"attack")||icontains(name,"damage")||icontains(name,"kill")||icontains(name,"hurt")) t += " [combat]";
+    if(icontains(name,"move")||icontains(name,"jump")||icontains(name,"fly")||icontains(name,"swim")) t += " [movement]";
+    if(icontains(name,"spawn")||icontains(name,"create")) t += " [factory]";
+    if(ret=="void" && nl<=2 && nl>0) t += " [obf-void]";
+    return t;
+}
+
+static std::string class_semantic_tags(const std::string& simple, const std::string& full,
+                                       const std::string& super, bool is_iface, bool is_enum){
+    if(is_enum)  return " [enum]";
+    if(is_iface) return " [interface]";
+    std::string t;
+    if(icontains(simple,"player")||icontains(full,"player")) t += " [player]";
+    if(icontains(simple,"entity")||icontains(super,"entity")) t += " [entity]";
+    if(icontains(simple,"render")||icontains(full,"render")||icontains(super,"render")) t += " [renderer]";
+    if(icontains(simple,"gui")||icontains(simple,"screen")||icontains(super,"gui")||icontains(super,"screen")) t += " [gui]";
+    if(icontains(simple,"packet")||icontains(full,"packet")) t += " [network]";
+    if(icontains(simple,"manager")||icontains(simple,"registry")) t += " [manager]";
+    if(icontains(simple,"world")||icontains(super,"world")) t += " [world]";
+    if(icontains(simple,"block")||icontains(super,"block")) t += " [block]";
+    if(icontains(simple,"item")||icontains(super,"item")) t += " [item]";
+    if(icontains(simple,"event")||icontains(simple,"handler")) t += " [event]";
+    if(icontains(simple,"thread")||icontains(super,"thread")||icontains(super,"runnable")) t += " [thread]";
+    if(icontains(simple,"exception")||icontains(super,"exception")||icontains(super,"error")) t += " [exception]";
+    if(icontains(simple,"inventory")||icontains(super,"inventory")) t += " [inventory]";
+    if(icontains(simple,"chunk")||icontains(super,"chunk")) t += " [chunk]";
+    if(icontains(simple,"sound")||icontains(simple,"audio")) t += " [audio]";
+    if(icontains(simple,"shader")||icontains(simple,"texture")) t += " [render-resource]";
+    if(icontains(simple,"ability")||icontains(simple,"skill")||icontains(simple,"effect")) t += " [gameplay]";
+    if(icontains(simple,"config")||icontains(simple,"setting")||icontains(simple,"option")) t += " [config]";
+    if(icontains(simple,"util")||icontains(simple,"helper")) t += " [utility]";
+    return t;
+}
+
+static std::string get_class_array_names(JNIEnv* env, jobject arr){
+    if(!arr) return "";
+    std::string out;
+    jint len = env->GetArrayLength((jarray)arr);
+    for(jint i = 0; i < len; i++){
+        jobject cls = env->GetObjectArrayElement((jobjectArray)arr, i);
+        raw_ExceptionClear(env);
+        if(!cls) continue;
+        if(!out.empty()) out += ", ";
+        out += get_type_name(env, cls);
+        raw_DeleteLocalRef(env, cls);
+    }
+    return out;
+}
+
 static void dump_class_fmt(JNIEnv* env, jclass klass, const std::string& dotname){
     if(!g_fmt_file) return;
-    if(!g_jmid_getDeclaredFields && !g_jmid_getDeclaredMethods) return;
 
     std::string simple_name = dotname;
     { size_t p = dotname.rfind('.'); if(p != std::string::npos) simple_name = dotname.substr(p+1); }
 
-    fprintf(g_fmt_file, "\n%s {\n  class: %s\n\n  fields: {\n", simple_name.c_str(), dotname.c_str());
+    jint cls_mods = 0;
+    bool is_iface = false, is_enum = false, is_anno = false;
+    std::string super_name, ifaces_str, annotations_str;
 
+    if(g_jmid_classMods)   { cls_mods = env->CallIntMethod(klass, g_jmid_classMods);           raw_ExceptionClear(env); }
+    if(g_jmid_isInterface) { is_iface = env->CallBooleanMethod(klass, g_jmid_isInterface) != 0; raw_ExceptionClear(env); }
+    if(g_jmid_isEnum)      { is_enum  = env->CallBooleanMethod(klass, g_jmid_isEnum)      != 0; raw_ExceptionClear(env); }
+    if(g_jmid_isAnnotation){ is_anno  = env->CallBooleanMethod(klass, g_jmid_isAnnotation) != 0;raw_ExceptionClear(env); }
+
+    if(g_jmid_getSuperclass){
+        jobject sc = raw_CallObjectMethod(env, klass, g_jmid_getSuperclass);
+        raw_ExceptionClear(env);
+        if(sc){ super_name = get_type_name(env, sc); raw_DeleteLocalRef(env, sc); }
+    }
+    if(g_jmid_getInterfaces){
+        jobject iarr = raw_CallObjectMethod(env, klass, g_jmid_getInterfaces);
+        raw_ExceptionClear(env);
+        if(iarr){ ifaces_str = get_class_array_names(env, iarr); raw_DeleteLocalRef(env, iarr); }
+    }
+    if(g_jmid_getAnnotations){
+        jobject aarr = raw_CallObjectMethod(env, klass, g_jmid_getAnnotations);
+        raw_ExceptionClear(env);
+        if(aarr){
+            jint alen = env->GetArrayLength((jarray)aarr);
+            for(jint i = 0; i < alen; i++){
+                jobject aobj = env->GetObjectArrayElement((jobjectArray)aarr, i);
+                raw_ExceptionClear(env);
+                if(!aobj) continue;
+                if(g_jmid_annoTypeName){
+                    jobject atype = raw_CallObjectMethod(env, aobj, g_jmid_annoTypeName);
+                    raw_ExceptionClear(env);
+                    if(atype){
+                        if(!annotations_str.empty()) annotations_str += ", ";
+                        annotations_str += "@" + get_type_name(env, atype);
+                        raw_DeleteLocalRef(env, atype);
+                    }
+                }
+                raw_DeleteLocalRef(env, aobj);
+            }
+            raw_DeleteLocalRef(env, aarr);
+        }
+    }
+
+    std::string kind;
+    if(is_anno)            kind = "ANNOTATION";
+    else if(is_iface)      kind = "INTERFACE";
+    else if(is_enum)       kind = "ENUM";
+    else if(cls_mods&0x400)kind = "ABSTRACT CLASS";
+    else                   kind = "CLASS";
+
+    bool is_final_cls = (cls_mods & 0x10) != 0;
+    std::string access   = decode_access(cls_mods);
+    std::string cls_tags = class_semantic_tags(simple_name, dotname, super_name, is_iface, is_enum);
+
+    fprintf(g_fmt_file, "\n%s {\n", simple_name.c_str());
+    fprintf(g_fmt_file, "  class:   %s\n", dotname.c_str());
+    fprintf(g_fmt_file, "  kind:    %s %s%s%s\n", access.c_str(), kind.c_str(),
+        is_final_cls ? " [final]" : "", cls_tags.c_str());
+    if(!super_name.empty() && super_name != "java.lang.Object")
+        fprintf(g_fmt_file, "  extends: %s\n", super_name.c_str());
+    if(!ifaces_str.empty())
+        fprintf(g_fmt_file, "  implements: [%s]\n", ifaces_str.c_str());
+    if(!annotations_str.empty())
+        fprintf(g_fmt_file, "  annotations: [%s]\n", annotations_str.c_str());
+    fprintf(g_fmt_file, "\n");
+
+    if(g_jmid_getDeclaredCtors && g_jcls_Constructor){
+        jobject carr = raw_CallObjectMethod(env, klass, g_jmid_getDeclaredCtors);
+        raw_ExceptionClear(env);
+        if(carr){
+            jint clen = env->GetArrayLength((jarray)carr);
+            if(clen > 0){
+                fprintf(g_fmt_file, "  constructors: {\n");
+                for(jint i = 0; i < clen; i++){
+                    jobject cobj = env->GetObjectArrayElement((jobjectArray)carr, i);
+                    raw_ExceptionClear(env);
+                    if(!cobj) continue;
+                    std::string cparams;
+                    if(g_jmid_ctorParams){
+                        jobject parr = raw_CallObjectMethod(env, cobj, g_jmid_ctorParams);
+                        raw_ExceptionClear(env);
+                        if(parr){ cparams = get_class_array_names(env, parr); raw_DeleteLocalRef(env, parr); }
+                    }
+                    jint cmods = 0;
+                    if(g_jmid_ctorMods){ cmods = env->CallIntMethod(cobj, g_jmid_ctorMods); raw_ExceptionClear(env); }
+                    fprintf(g_fmt_file, "    %s(%s)  [%s]\n",
+                        simple_name.c_str(), cparams.c_str(), decode_access(cmods).c_str());
+                    raw_DeleteLocalRef(env, cobj);
+                }
+                fprintf(g_fmt_file, "  }\n\n");
+            }
+            raw_DeleteLocalRef(env, carr);
+        }
+        raw_ExceptionClear(env);
+    }
+
+    fprintf(g_fmt_file, "  fields: {\n");
     if(g_jmid_getDeclaredFields){
         jobject farr = raw_CallObjectMethod(env, klass, g_jmid_getDeclaredFields);
         raw_ExceptionClear(env);
@@ -266,59 +535,47 @@ static void dump_class_fmt(JNIEnv* env, jclass klass, const std::string& dotname
             for(jint i = 0; i < flen; i++){
                 jobject fobj = env->GetObjectArrayElement((jobjectArray)farr, i);
                 if(!fobj){ raw_ExceptionClear(env); continue; }
-
                 std::string fname;
                 if(g_jmid_fldName){
                     jstring js = (jstring)raw_CallObjectMethod(env, fobj, g_jmid_fldName);
                     raw_ExceptionClear(env);
                     if(js){ fname = jstr_to_std(env, js); raw_DeleteLocalRef(env, js); }
                 }
-
                 std::string ftype = "?";
                 if(g_jmid_fldType){
                     jobject ft = raw_CallObjectMethod(env, fobj, g_jmid_fldType);
                     raw_ExceptionClear(env);
                     if(ft){ ftype = get_type_name(env, ft); raw_DeleteLocalRef(env, ft); }
                 }
-
                 jint mods = 0;
-                if(g_jmid_fldMods){
-                    mods = env->CallIntMethod(fobj, g_jmid_fldMods);
-                    raw_ExceptionClear(env);
-                }
+                if(g_jmid_fldMods){ mods = env->CallIntMethod(fobj, g_jmid_fldMods); raw_ExceptionClear(env); }
                 bool is_static = (mods & 0x8) != 0;
-
                 jlong offset = -1;
-                if(g_unsafe && fobj){
+                if(g_unsafe){
                     jmethodID mid = is_static ? g_jmid_unsafeSFO : g_jmid_unsafeOFO;
-                    if(mid){
-                        offset = env->CallLongMethod(g_unsafe, mid, fobj);
-                        raw_ExceptionClear(env);
-                    }
-
+                    if(mid){ offset = env->CallLongMethod(g_unsafe, mid, fobj); raw_ExceptionClear(env); }
                 }
-
+                std::string ftags   = field_semantic_tags(fname, ftype, mods);
+                std::string faccess = decode_access(mods);
                 if(!fname.empty()){
                     if(offset >= 0)
                         fprintf(g_fmt_file,
-                            "    %s -> type: %s, unsafe-offset: 0x%llX (dec %lld)%s\n",
-                            fname.c_str(), ftype.c_str(),
+                            "    %-36s  %s  type: %-48s  offset: 0x%04llX (dec %-6lld)%s%s\n",
+                            fname.c_str(), faccess.c_str(), ftype.c_str(),
                             (unsigned long long)offset, (long long)offset,
-                            is_static ? " [static]" : "");
+                            is_static ? " [static]" : "", ftags.c_str());
                     else
                         fprintf(g_fmt_file,
-                            "    %s -> type: %s%s\n",
-                            fname.c_str(), ftype.c_str(),
-                            is_static ? " [static]" : "");
+                            "    %-36s  %s  type: %s%s%s\n",
+                            fname.c_str(), faccess.c_str(), ftype.c_str(),
+                            is_static ? " [static]" : "", ftags.c_str());
                 }
-
                 raw_DeleteLocalRef(env, fobj);
             }
             raw_DeleteLocalRef(env, farr);
         }
         raw_ExceptionClear(env);
     }
-
     fprintf(g_fmt_file, "  }\n\n  methods: {\n");
 
     if(g_jmid_getDeclaredMethods){
@@ -329,49 +586,42 @@ static void dump_class_fmt(JNIEnv* env, jclass klass, const std::string& dotname
             for(jint i = 0; i < mlen; i++){
                 jobject mobj = env->GetObjectArrayElement((jobjectArray)marr, i);
                 if(!mobj){ raw_ExceptionClear(env); continue; }
-
                 std::string mname;
                 if(g_jmid_mthName){
                     jstring js = (jstring)raw_CallObjectMethod(env, mobj, g_jmid_mthName);
                     raw_ExceptionClear(env);
                     if(js){ mname = jstr_to_std(env, js); raw_DeleteLocalRef(env, js); }
                 }
-
                 std::string ret_type = "void";
                 if(g_jmid_mthRet){
                     jobject rt = raw_CallObjectMethod(env, mobj, g_jmid_mthRet);
                     raw_ExceptionClear(env);
                     if(rt){ ret_type = get_type_name(env, rt); raw_DeleteLocalRef(env, rt); }
                 }
-
                 std::string params_str;
                 if(g_jmid_mthParams){
                     jobject parr = raw_CallObjectMethod(env, mobj, g_jmid_mthParams);
                     raw_ExceptionClear(env);
-                    if(parr){
-                        jint plen = env->GetArrayLength((jarray)parr);
-                        for(jint j = 0; j < plen; j++){
-                            jobject pcls = env->GetObjectArrayElement((jobjectArray)parr, j);
-                            raw_ExceptionClear(env);
-                            if(j > 0) params_str += ", ";
-                            if(pcls){ params_str += get_type_name(env, pcls); raw_DeleteLocalRef(env, pcls); }
-                        }
-                        raw_DeleteLocalRef(env, parr);
-                    }
+                    if(parr){ params_str = get_class_array_names(env, parr); raw_DeleteLocalRef(env, parr); }
                 }
-
-                jint mmods = 0;
-                if(g_jmid_mthMods){
-                    mmods = env->CallIntMethod(mobj, g_jmid_mthMods);
+                std::string exc_str;
+                if(g_jmid_mthExcTypes){
+                    jobject earr = raw_CallObjectMethod(env, mobj, g_jmid_mthExcTypes);
                     raw_ExceptionClear(env);
+                    if(earr){ exc_str = get_class_array_names(env, earr); raw_DeleteLocalRef(env, earr); }
                 }
+                jint mmods = 0;
+                if(g_jmid_mthMods){ mmods = env->CallIntMethod(mobj, g_jmid_mthMods); raw_ExceptionClear(env); }
                 bool m_static = (mmods & 0x8) != 0;
-
-                if(!mname.empty())
-                    fprintf(g_fmt_file, "    %s(%s) -> returns: %s%s\n",
-                        mname.c_str(), params_str.c_str(), ret_type.c_str(),
-                        m_static ? " [static]" : "");
-
+                std::string mtags   = method_semantic_tags(mname, ret_type, mmods);
+                std::string maccess = decode_access(mmods);
+                if(!mname.empty()){
+                    fprintf(g_fmt_file, "    %-36s  %s(%s) -> %s%s%s\n",
+                        mname.c_str(), maccess.c_str(), params_str.c_str(), ret_type.c_str(),
+                        m_static ? " [static]" : "", mtags.c_str());
+                    if(!exc_str.empty())
+                        fprintf(g_fmt_file, "        throws: [%s]\n", exc_str.c_str());
+                }
                 raw_DeleteLocalRef(env, mobj);
             }
             raw_DeleteLocalRef(env, marr);
