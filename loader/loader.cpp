@@ -146,10 +146,21 @@ int main(int argc, char* argv[]){
         }
     }
     printf("[+] craftrise-x64.exe bulundu — PID: %lu\n", pid);
-    printf("[*] 2 saniye bekleniyor...\n");
-    Sleep(2000);
+    printf("[*] Pencere bekleniyor...\n");
 
-    printf("[*] Inject ediliyor...\n");
+    int win_tick = 0;
+    while(!process_has_window(pid)){
+        Sleep(500);
+        if(++win_tick % 10 == 0)
+            printf("[~] Pencere bekleniyor... (%ds)\n", win_tick / 2);
+        // Re-check PID still alive
+        if(find_pid(L"craftrise-x64.exe") == 0){
+            printf("[!] Craftrise kapandi.\n");
+            return 1;
+        }
+    }
+    printf("[+] Pencere geldi — inject ediliyor...\n");
+
     if(!inject(pid, dll_path)) return 1;
 
     printf("[+] Basarili. CRNativeDumper konsol penceresi acilacak.\n");

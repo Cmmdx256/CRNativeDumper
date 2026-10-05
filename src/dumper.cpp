@@ -515,12 +515,10 @@ static std::string json_escape(const std::string& s){
     return r;
 }
 
-static bool g_schema_first_class = true;
-static bool g_schema_first_method = true;
-
 static void dump_class_schema(JNIEnv* env, jclass klass, const std::string& dotname){
     if(!g_schema_file) return;
 
+    // ── source file name ───────────────────────────────────────────────────
     std::string src_name;
     if(g_source_names.count(dotname)) src_name = g_source_names[dotname];
     if(src_name.empty() && g_jvmti){
@@ -533,91 +531,125 @@ static void dump_class_schema(JNIEnv* env, jclass klass, const std::string& dotn
         }
     }
 
+    // ── kind / super / tags ────────────────────────────────────────────────
     std::string kind_str, tags_str, super_str;
     if(g_jmid_isInterface && env->CallBooleanMethod(klass, g_jmid_isInterface)) kind_str = "INTERFACE";
     else if(g_jmid_isEnum && env->CallBooleanMethod(klass, g_jmid_isEnum)) kind_str = "ENUM";
     else kind_str = "CLASS";
     env->ExceptionClear();
-
     {
         std::string lo = dotname;
         for(char& c : lo) c = (char)tolower((unsigned char)c);
         const char* nk[] = {"network","packet","entity","render","gui","manager","world","block","item","player","chat","util",nullptr};
         for(int k=0; nk[k]; k++) if(lo.find(nk[k])!=std::string::npos){
-            if(!tags_str.empty()) tags_str+=",";
-            tags_str += "\""; tags_str += nk[k]; tags_str += "\"";
+            if(!tags_str.empty()) tags_str += " ";
+            tags_str += "["; tags_str += nk[k]; tags_str += "]";
         }
     }
-
     if(g_jmid_getSuperclass){
         jobject sc = env->CallObjectMethod(klass, g_jmid_getSuperclass);
         env->ExceptionClear();
-        if(sc){
-            super_str = get_type_name(env, sc);
-            env->DeleteLocalRef(sc);
-        }
+        if(sc){ super_str = get_type_name(env, sc); env->DeleteLocalRef(sc); }
     }
 
-    if(!g_schema_first_class) fprintf(g_schema_file, ",\n");
-    g_schema_first_class = false;
-
-    fprintf(g_schema_file, "    \"%s\": {\n", json_escape(dotname).c_str());
+    // ── header ─────────────────────────────────────────────────────────────
+    fprintf(g_schema_file, "─────────────────────────────────────────────────────────\n");
+    fprintf(g_schema_file, "%s  %s\n", kind_str.c_str(), dotname.c_str());
     if(!src_name.empty())
-        fprintf(g_schema_file, "      \"sourceFile\": \"%s\",\n", json_escape(src_name).c_str());
-    fprintf(g_schema_file, "      \"kind\": \"%s\",\n", kind_str.c_str());
+        fprintf(g_schema_file, "  source  : %s\n", src_name.c_str());
     if(!super_str.empty() && super_str != "java.lang.Object")
-        fprintf(g_schema_file, "      \"superClass\": \"%s\",\n", json_escape(super_str).c_str());
+        fprintf(g_schema_file, "  extends : %s\n", super_str.c_str());
     if(!tags_str.empty())
-        fprintf(g_schema_file, "      \"tags\": [%s],\n", tags_str.c_str());
+        fprintf(g_schema_file, "  tags    : %s\n", tags_str.c_str());
 
-    fprintf(g_schema_file, "      \"fields\": {");
-    bool first_f = true;
-    if(g_jvmti){
-        jint fc=0; jfieldID* fields=nullptr;
-        if(g_jvmti->GetClassFields(klass,&fc,&fields)==JVMTI_ERROR_NONE && fields){
-            for(jint i=0;i<fc;i++){
-                char *fn=nullptr,*fd=nullptr,*fg=nullptr;
-                if(g_jvmti->GetFieldName(klass,fields[i],&fn,&fd,&fg)==JVMTI_ERROR_NONE && fn){
-                    if(!first_f) fprintf(g_schema_file,",");
-                    first_f=false;
-                    fprintf(g_schema_file,"\n        \"%s\": \"%s\"",
-                        json_escape(fn).c_str(), json_escape(fd?fd:"?").c_str());
+    // ── fields via JNI reflection ──────────────────────────────────────────
+    fprintf(g_schema_file, "  FIELDS\n");
+    if(g_jmid_getDeclaredFields){
+        jobject farr = env->CallObjectMethod(klass, g_jmid_getDeclaredFields);
+        env->ExceptionClear();
+        if(farr){
+            jint flen = env->GetArrayLength((jarray)farr); env->ExceptionClear();
+            for(jint i=0;i<flen;i++){
+                jobject fobj = env->GetObjectArrayElement((jobjectArray)farr, i);
+                env->ExceptionClear();
+                if(!fobj) continue;
+                jstring fname_js = nullptr;
+                if(g_jmid_fldName) fname_js=(jstring)env->CallObjectMethod(fobj,g_jmid_fldName);
+                env->ExceptionClear();
+                jstring ftype_js = nullptr;
+                if(g_jmid_fldType){
+                    jobject ft = env->CallObjectMethod(fobj,g_jmid_fldType);
+                    env->ExceptionClear();
+                    if(ft && g_jmid_getName) ftype_js=(jstring)env->CallObjectMethod(ft,g_jmid_getName);
+                    env->ExceptionClear();
+                    if(ft) env->DeleteLocalRef(ft);
                 }
-                if(fn) g_jvmti->Deallocate((unsigned char*)fn);
-                if(fd) g_jvmti->Deallocate((unsigned char*)fd);
-                if(fg) g_jvmti->Deallocate((unsigned char*)fg);
+                std::string fn = fname_js ? jstr_to_std(env,fname_js) : "?";
+                std::string ft2 = ftype_js ? jstr_to_std(env,ftype_js) : "?";
+                fprintf(g_schema_file, "    %-32s  %s\n", fn.c_str(), ft2.c_str());
+                if(fname_js) env->DeleteLocalRef(fname_js);
+                if(ftype_js) env->DeleteLocalRef(ftype_js);
+                env->DeleteLocalRef(fobj);
             }
-            g_jvmti->Deallocate((unsigned char*)fields);
+            env->DeleteLocalRef(farr);
         }
     }
-    fprintf(g_schema_file, first_f ? "}" : "\n      }");
 
-    fprintf(g_schema_file, ",\n      \"methods\": {");
-    bool first_m = true;
-    if(g_jvmti){
-        jint mc=0; jmethodID* methods=nullptr;
-        if(g_jvmti->GetClassMethods(klass,&mc,&methods)==JVMTI_ERROR_NONE && methods){
-            for(jint i=0;i<mc;i++){
-                char *mn=nullptr,*md=nullptr,*mg=nullptr;
-                if(g_jvmti->GetMethodName(methods[i],&mn,&md,&mg)==JVMTI_ERROR_NONE && mn){
-                    if(!first_m) fprintf(g_schema_file,",");
-                    first_m=false;
-                    std::string desc_str = md ? md : "";
-                    std::string human = desc_to_human(desc_str);
-                    fprintf(g_schema_file,"\n        \"%s\": {\"desc\":\"%s\",\"signature\":\"%s\"}",
-                        json_escape(mn).c_str(),
-                        json_escape(desc_str).c_str(),
-                        json_escape(human).c_str());
+    // ── methods via JNI reflection ─────────────────────────────────────────
+    fprintf(g_schema_file, "  METHODS\n");
+    if(g_jmid_getDeclaredMethods){
+        jobject marr = env->CallObjectMethod(klass, g_jmid_getDeclaredMethods);
+        env->ExceptionClear();
+        if(marr){
+            jint mlen = env->GetArrayLength((jarray)marr); env->ExceptionClear();
+            for(jint i=0;i<mlen;i++){
+                jobject mobj = env->GetObjectArrayElement((jobjectArray)marr, i);
+                env->ExceptionClear();
+                if(!mobj) continue;
+                jstring mname_js = nullptr;
+                if(g_jmid_mthName) mname_js=(jstring)env->CallObjectMethod(mobj,g_jmid_mthName);
+                env->ExceptionClear();
+                jstring rtype_js = nullptr;
+                if(g_jmid_mthRet){
+                    jobject rt = env->CallObjectMethod(mobj,g_jmid_mthRet);
+                    env->ExceptionClear();
+                    if(rt && g_jmid_getName) rtype_js=(jstring)env->CallObjectMethod(rt,g_jmid_getName);
+                    env->ExceptionClear();
+                    if(rt) env->DeleteLocalRef(rt);
                 }
-                if(mn) g_jvmti->Deallocate((unsigned char*)mn);
-                if(md) g_jvmti->Deallocate((unsigned char*)md);
-                if(mg) g_jvmti->Deallocate((unsigned char*)mg);
+                std::string params;
+                if(g_jmid_mthParams){
+                    jobject ptarr = env->CallObjectMethod(mobj,g_jmid_mthParams);
+                    env->ExceptionClear();
+                    if(ptarr){
+                        jint plen = env->GetArrayLength((jarray)ptarr); env->ExceptionClear();
+                        for(jint j=0;j<plen;j++){
+                            jobject pt = env->GetObjectArrayElement((jobjectArray)ptarr,j);
+                            env->ExceptionClear();
+                            if(pt){
+                                if(!params.empty()) params += ", ";
+                                if(g_jmid_getName){
+                                    jstring pn=(jstring)env->CallObjectMethod(pt,g_jmid_getName);
+                                    env->ExceptionClear();
+                                    if(pn){ params+=jstr_to_std(env,pn); env->DeleteLocalRef(pn); }
+                                }
+                                env->DeleteLocalRef(pt);
+                            }
+                        }
+                        env->DeleteLocalRef(ptarr);
+                    }
+                }
+                std::string mn = mname_js ? jstr_to_std(env,mname_js) : "?";
+                std::string rt = rtype_js ? jstr_to_std(env,rtype_js) : "?";
+                fprintf(g_schema_file, "    %s(%s)  ->  %s\n", mn.c_str(), params.c_str(), rt.c_str());
+                if(mname_js) env->DeleteLocalRef(mname_js);
+                if(rtype_js) env->DeleteLocalRef(rtype_js);
+                env->DeleteLocalRef(mobj);
             }
-            g_jvmti->Deallocate((unsigned char*)methods);
+            env->DeleteLocalRef(marr);
         }
     }
-    fprintf(g_schema_file, first_m ? "}" : "\n      }");
-    fprintf(g_schema_file, "\n    }");
+    fprintf(g_schema_file, "\n");
     fflush(g_schema_file);
 }
 
@@ -849,8 +881,13 @@ static void dump_class(jclass klass){
         for(char& c : lo) c = (char)tolower((unsigned char)c);
         const char* nk[] = {"network","packet","handshake","netty","channel","socket","login","connect","netmanager","packethandler",nullptr};
         for(int ki = 0; nk[ki]; ki++) if(lo.find(nk[ki]) != std::string::npos){ is_net_class = true; break; }
-        const char* ck[] = {"verify","encrypt","decrypt","cipher","crypto","secret","handshake","riseverify","risevoice",nullptr};
-        for(int ki = 0; ck[ki]; ki++) if(lo.find(ck[ki]) != std::string::npos){ is_rise_crypto = true; break; }
+        // Only flag craftrise.* or crsecond.* classes — not JDK's own crypto classes
+        bool is_cr_pkg = (lo.find("craftrise.") == 0 || lo.find("crsecond.") == 0 ||
+                          lo.find("craftrise/") == 0 || lo.find("crsecond/") == 0);
+        if(is_cr_pkg){
+            const char* ck[] = {"verify","encrypt","decrypt","cipher","crypto","secret","handshake","riseverify","risevoice","login","auth",nullptr};
+            for(int ki = 0; ck[ki]; ki++) if(lo.find(ck[ki]) != std::string::npos){ is_rise_crypto = true; break; }
+        }
     }
 
     std::string sig = "L";
@@ -1132,52 +1169,112 @@ static void write_crypto_entry(const std::string& class_path,
     if(!g_crypto_file) return;
     fprintf(g_crypto_file, "================================================================\n");
     fprintf(g_crypto_file, "[CLASS] %s\n", class_path.c_str());
-    fprintf(g_crypto_file, "  Crypto/Network constants found in constant pool:\n");
-    // Dedup strings
-    std::set<std::string> seen;
-    for(auto& s : strings){
-        if(seen.count(s)) continue;
-        seen.insert(s);
-        // Skip boring internal strings
-        if(s.size()<4) continue;
-        bool looks_interesting = false;
-        const char* interest[] = {
-            "AES","RSA","SHA","Cipher","Key","Encrypt","Decrypt","Hash","Sign",
-            "Verify","Random","TLS","SSL","Rise","craftrise","crsecond",
-            "NoPadding","PKCS","GCM","CFB","CBC",nullptr
-        };
-        for(int k=0;interest[k];k++) if(s.find(interest[k])!=std::string::npos){looks_interesting=true;break;}
-        if(looks_interesting)
+
+    // Print interesting constant pool strings
+    if(!strings.empty()){
+        fprintf(g_crypto_file, "  Constant pool references:\n");
+        std::set<std::string> seen;
+        for(auto& s : strings){
+            if(seen.count(s) || s.size()<3) continue;
+            seen.insert(s);
             fprintf(g_crypto_file, "    \"%s\"\n", s.c_str());
-    }
-    if(klass && g_jvmti){
-        fprintf(g_crypto_file, "  Fields:\n");
-        jint fc=0; jfieldID* fields=nullptr;
-        if(g_jvmti->GetClassFields(klass,&fc,&fields)==JVMTI_ERROR_NONE && fields){
-            for(jint i=0;i<fc;i++){
-                char *fn=nullptr,*fd=nullptr,*fg=nullptr;
-                if(g_jvmti->GetFieldName(klass,fields[i],&fn,&fd,&fg)==JVMTI_ERROR_NONE && fn)
-                    fprintf(g_crypto_file,"    %-30s  %s\n",fn,fd?fd:"?");
-                if(fn) g_jvmti->Deallocate((unsigned char*)fn);
-                if(fd) g_jvmti->Deallocate((unsigned char*)fd);
-                if(fg) g_jvmti->Deallocate((unsigned char*)fg);
-            }
-            g_jvmti->Deallocate((unsigned char*)fields);
         }
-        fprintf(g_crypto_file, "  Methods:\n");
-        jint mc=0; jmethodID* methods=nullptr;
-        if(g_jvmti->GetClassMethods(klass,&mc,&methods)==JVMTI_ERROR_NONE && methods){
-            for(jint i=0;i<mc;i++){
-                char *mn=nullptr,*md=nullptr,*mg=nullptr;
-                if(g_jvmti->GetMethodName(methods[i],&mn,&md,&mg)==JVMTI_ERROR_NONE && mn){
-                    std::string human = desc_to_human(md?md:"");
-                    fprintf(g_crypto_file,"    %-30s  %s\n",mn,human.c_str());
+    }
+
+    if(klass && g_env){
+        JNIEnv* env = g_env;
+        // ── Fields via JNI reflection ──────────────────────────────────────
+        fprintf(g_crypto_file, "  Fields:\n");
+        if(g_jmid_getDeclaredFields){
+            jobject farr = env->CallObjectMethod(klass, g_jmid_getDeclaredFields);
+            env->ExceptionClear();
+            if(farr){
+                jint flen = env->GetArrayLength((jarray)farr);
+                env->ExceptionClear();
+                for(jint i=0;i<flen;i++){
+                    jobject fobj = env->GetObjectArrayElement((jobjectArray)farr, i);
+                    env->ExceptionClear();
+                    if(!fobj){continue;}
+                    // Field.getName()
+                    jstring fname_js = nullptr;
+                    if(g_jmid_getName) fname_js=(jstring)env->CallObjectMethod(fobj,g_jmid_getName);
+                    env->ExceptionClear();
+                    // Field.getType().getName()
+                    jstring ftype_js = nullptr;
+                    if(g_jmid_fldType){
+                        jobject ftype = env->CallObjectMethod(fobj, g_jmid_fldType);
+                        env->ExceptionClear();
+                        if(ftype && g_jmid_getName)
+                            ftype_js=(jstring)env->CallObjectMethod(ftype, g_jmid_getName);
+                        env->ExceptionClear();
+                        if(ftype) env->DeleteLocalRef(ftype);
+                    }
+                    std::string fn = fname_js ? jstr_to_std(env,fname_js) : "?";
+                    std::string ft = ftype_js ? jstr_to_std(env,ftype_js) : "?";
+                    fprintf(g_crypto_file,"    %-30s  %s\n", fn.c_str(), ft.c_str());
+                    if(fname_js) env->DeleteLocalRef(fname_js);
+                    if(ftype_js) env->DeleteLocalRef(ftype_js);
+                    env->DeleteLocalRef(fobj);
                 }
-                if(mn) g_jvmti->Deallocate((unsigned char*)mn);
-                if(md) g_jvmti->Deallocate((unsigned char*)md);
-                if(mg) g_jvmti->Deallocate((unsigned char*)mg);
+                env->DeleteLocalRef(farr);
             }
-            g_jvmti->Deallocate((unsigned char*)methods);
+        }
+        // ── Methods via JNI reflection ─────────────────────────────────────
+        fprintf(g_crypto_file, "  Methods:\n");
+        if(g_jmid_getDeclaredMethods){
+            jobject marr = env->CallObjectMethod(klass, g_jmid_getDeclaredMethods);
+            env->ExceptionClear();
+            if(marr){
+                jint mlen = env->GetArrayLength((jarray)marr);
+                env->ExceptionClear();
+                for(jint i=0;i<mlen;i++){
+                    jobject mobj = env->GetObjectArrayElement((jobjectArray)marr, i);
+                    env->ExceptionClear();
+                    if(!mobj) continue;
+                    jstring mname_js = nullptr;
+                    if(g_jmid_getName) mname_js=(jstring)env->CallObjectMethod(mobj,g_jmid_getName);
+                    env->ExceptionClear();
+                    jstring rtype_js = nullptr;
+                    if(g_jmid_mthRet){
+                        jobject rt = env->CallObjectMethod(mobj, g_jmid_mthRet);
+                        env->ExceptionClear();
+                        if(rt && g_jmid_getName) rtype_js=(jstring)env->CallObjectMethod(rt,g_jmid_getName);
+                        env->ExceptionClear();
+                        if(rt) env->DeleteLocalRef(rt);
+                    }
+                    // Parameter types
+                    std::string params;
+                    if(g_jmid_mthParams){
+                        jobject ptarr = env->CallObjectMethod(mobj, g_jmid_mthParams);
+                        env->ExceptionClear();
+                        if(ptarr){
+                            jint plen = env->GetArrayLength((jarray)ptarr);
+                            env->ExceptionClear();
+                            for(jint j=0;j<plen;j++){
+                                jobject pt = env->GetObjectArrayElement((jobjectArray)ptarr,j);
+                                env->ExceptionClear();
+                                if(pt){
+                                    if(!params.empty()) params+=", ";
+                                    if(g_jmid_getName){
+                                        jstring pn=(jstring)env->CallObjectMethod(pt,g_jmid_getName);
+                                        env->ExceptionClear();
+                                        if(pn){ params+=jstr_to_std(env,pn); env->DeleteLocalRef(pn); }
+                                    }
+                                    env->DeleteLocalRef(pt);
+                                }
+                            }
+                            env->DeleteLocalRef(ptarr);
+                        }
+                    }
+                    std::string mn = mname_js ? jstr_to_std(env,mname_js) : "?";
+                    std::string rt = rtype_js ? jstr_to_std(env,rtype_js) : "?";
+                    fprintf(g_crypto_file,"    %s(%s) -> %s\n", mn.c_str(), params.c_str(), rt.c_str());
+                    if(mname_js) env->DeleteLocalRef(mname_js);
+                    if(rtype_js) env->DeleteLocalRef(rtype_js);
+                    env->DeleteLocalRef(mobj);
+                }
+                env->DeleteLocalRef(marr);
+            }
         }
     }
     fprintf(g_crypto_file, "\n");
@@ -1344,6 +1441,94 @@ static void extract_jars_from_classpath(JNIEnv* /*hint_env*/){
     if(we_attached) g_jvm->DetachCurrentThread();
 }
 
+
+// Walk extracted .class files in craftrisedumped/, scan constant pool for crypto refs
+static void scan_classfiles_for_crypto(){
+    if(!g_crypto_file || g_class_dump_dir[0]=='\0') return;
+    // We only want craftrise/ and crsecond/ subdirs
+    const char* pkg_roots[] = {"craftrise", "crsecond", nullptr};
+    // Use Windows FindFirstFile recursion
+    struct ScanCtx {
+        static void walk(const std::string& dir, const char* pkg_root, FILE* out, JNIEnv* env){
+            std::string pat = dir + "\\*";
+            WIN32_FIND_DATAA fd;
+            HANDLE h = FindFirstFileA(pat.c_str(), &fd);
+            if(h==INVALID_HANDLE_VALUE) return;
+            do {
+                if(fd.cFileName[0]=='.') continue;
+                std::string full = dir + "\\" + fd.cFileName;
+                if(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY){
+                    walk(full, pkg_root, out, env);
+                } else {
+                    size_t nlen = strlen(fd.cFileName);
+                    if(nlen>6 && strcmp(fd.cFileName+nlen-6,".class")==0){
+                        // Read file
+                        FILE* f = fopen(full.c_str(),"rb");
+                        if(!f) continue;
+                        fseek(f,0,SEEK_END); long fsz=ftell(f); fseek(f,0,SEEK_SET);
+                        if(fsz<10||fsz>2*1024*1024){ fclose(f); continue; }
+                        std::vector<uint8_t> buf((size_t)fsz);
+                        fread(buf.data(),1,(size_t)fsz,f); fclose(f);
+                        // Check magic
+                        if(buf[0]!=0xCA||buf[1]!=0xFE||buf[2]!=0xBA||buf[3]!=0xBE) continue;
+                        // Parse constant pool for crypto refs
+                        auto strs = parse_crypto_strings(buf);
+                        // Filter to real crypto (not just "craftrise")
+                        std::vector<std::string> hits;
+                        const char* cfilter[] = {
+                            "AES","RSA","SHA","Cipher","SecretKey","KeyFactory","KeyGenerator",
+                            "MessageDigest","SecureRandom","NoPadding","PKCS","GCM","CFB8","CBC",
+                            "javax/crypto","java/security/MessageDigest","java/security/KeyPair",
+                            "RiseVerify","RiseVoice","RiseKeepAlive","verify","encrypt","decrypt",
+                            "handshake","login","auth","token","hmac","HMAC",nullptr};
+                        for(auto& s : strs){
+                            bool ok=false;
+                            for(int k=0;cfilter[k];k++) if(s.find(cfilter[k])!=std::string::npos){ok=true;break;}
+                            if(ok) hits.push_back(s);
+                        }
+                        if(hits.empty()) continue;
+                        // Derive class dotname from path
+                        std::string class_name = full;
+                        // Remove g_class_dump_dir prefix
+                        // Replace \ with .
+                        std::string prefix = g_class_dump_dir;
+                        if(class_name.substr(0,prefix.size())==prefix)
+                            class_name = class_name.substr(prefix.size()+1);
+                        // Remove .class suffix
+                        if(class_name.size()>6) class_name=class_name.substr(0,class_name.size()-6);
+                        for(char& c:class_name) if(c=='\\') c='.';
+                        // Try to find loaded jclass
+                        std::string slashname = class_name;
+                        for(char& c:slashname) if(c=='.') c='/';
+                        jclass kls = nullptr;
+                        if(env){
+                            kls = env->FindClass(slashname.c_str());
+                            env->ExceptionClear();
+                        }
+                        write_crypto_entry(class_name, hits, kls);
+                        if(kls && env) env->DeleteLocalRef(kls);
+                    }
+                }
+            } while(FindNextFileA(h,&fd));
+            FindClose(h);
+        }
+    };
+    // Attach current thread
+    JNIEnv* env=nullptr; bool att=false;
+    JavaVMAttachArgs a={JNI_VERSION_1_8,(char*)"CRDumper-Crypto",nullptr};
+    if(g_jvm){ jint r=g_jvm->GetEnv((void**)&env,JNI_VERSION_1_8); if(r==JNI_EDETACHED&&g_jvm->AttachCurrentThread((void**)&env,&a)==JNI_OK) att=true; }
+    fprintf(g_crypto_file,"================================================================\n");
+    fprintf(g_crypto_file,"  Craftrise/crsecond classes referencing crypto APIs:\n");
+    fprintf(g_crypto_file,"================================================================\n\n");
+    for(int pi=0; pkg_roots[pi]; pi++){
+        std::string pkg_dir = std::string(g_class_dump_dir) + "\\" + pkg_roots[pi];
+        ScanCtx::walk(pkg_dir, pkg_roots[pi], g_crypto_file, env);
+    }
+    if(att && g_jvm) g_jvm->DetachCurrentThread();
+    con_log(GREEN,"[+] Crypto scan tamam\n");
+}
+
+
 static DWORD WINAPI class_monitor_thread(LPVOID){
     while(!g_dump_done.load()) Sleep(1000);
     Sleep(5000);
@@ -1397,6 +1582,7 @@ static void do_snapshot(){
     con_log(WHITE, "[*] Snapshot: %d class\n", cnt);
 
     extract_jars_from_classpath(g_env);
+    scan_classfiles_for_crypto();
 
     for(jint i = 0; i < cnt; i++) dump_class(cls[i]);
     g_jvmti->Deallocate((unsigned char*)cls);
@@ -1467,10 +1653,10 @@ static void initialize_and_dump(JNIEnv* env){
     }
     {
         char sch_path[MAX_PATH] = {};
-        _snprintf_s(sch_path, sizeof(sch_path), "%s\\mappings_schema.json", g_outdir);
+        _snprintf_s(sch_path, sizeof(sch_path), "%s\\mappings_schema.txt", g_outdir);
         g_schema_file = _fsopen(sch_path, "w", _SH_DENYNO);
         if(g_schema_file){
-            fprintf(g_schema_file, "{\n  \"generated_by\": \"CRNativeDumper --By cmmdx256\",\n  \"classes\": {\n");
+            fprintf(g_schema_file, "CRNativeDumper -- Class Schema Map --By cmmdx256\n\n");
             con_log(GREEN, "[+] Schema dosya: %s\n", sch_path);
         }
     }
@@ -1502,7 +1688,7 @@ static void initialize_and_dump(JNIEnv* env){
     if(g_fmt_file){ fprintf(g_fmt_file, "\n--By cmmdx256\n"); fflush(g_fmt_file); }
     if(g_dbg)     { fprintf(g_dbg,      "\n--By cmmdx256\n"); fflush(g_dbg); }
     if(g_net_file){ fprintf(g_net_file, "\n--By cmmdx256\n"); fflush(g_net_file); }
-    if(g_schema_file){ fprintf(g_schema_file, "\n  }\n}\n"); fflush(g_schema_file); }
+    if(g_schema_file){ fprintf(g_schema_file, "\n--By cmmdx256\n"); fflush(g_schema_file); }
     if(g_crypto_file){ fprintf(g_crypto_file, "\n-- END --By cmmdx256\n"); fflush(g_crypto_file); }
 
     g_dump_done.store(true);
