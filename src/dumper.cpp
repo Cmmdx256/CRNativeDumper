@@ -92,6 +92,7 @@ static FILE*  g_fmt_file = nullptr;
 static FILE*  g_net_file    = nullptr;
 static FILE*  g_schema_file = nullptr;
 static FILE*  g_crypto_file = nullptr;
+static FILE*  g_deobf_file  = nullptr;  // obfuscated -> original name mappings
 static HANDLE g_con  = INVALID_HANDLE_VALUE;
 static std::mutex            g_mutex;
 static std::set<std::string> g_written;
@@ -916,13 +917,9 @@ static bool dump_class(jclass klass){
         for(char& c : lo) c = (char)tolower((unsigned char)c);
         const char* nk[] = {"network","packet","handshake","netty","channel","socket","login","connect","netmanager","packethandler",nullptr};
         for(int ki = 0; nk[ki]; ki++) if(lo.find(nk[ki]) != std::string::npos){ is_net_class = true; break; }
-        // Only flag craftrise.* or crsecond.* classes — not JDK's own crypto classes
-        bool is_cr_pkg = (lo.find("craftrise.") == 0 || lo.find("crsecond.") == 0 ||
-                          lo.find("craftrise/") == 0 || lo.find("crsecond/") == 0);
-        if(is_cr_pkg){
-            const char* ck[] = {"verify","encrypt","decrypt","cipher","crypto","secret","handshake","riseverify","risevoice","login","auth",nullptr};
-            for(int ki = 0; ck[ki]; ki++) if(lo.find(ck[ki]) != std::string::npos){ is_rise_crypto = true; break; }
-        }
+        // ALL craftrise.*/crsecond.* classes go to crypto/handshake file
+        // (class names are fully obfuscated Cyrillic — keyword matching doesn't work)
+        is_rise_crypto = (lo.rfind("craftrise.", 0) == 0 || lo.rfind("crsecond.", 0) == 0);
     }
 
     std::string sig = "L";
@@ -1105,6 +1102,21 @@ static bool dump_class(jclass klass){
         write_crypto_entry(label, dummy_strings, klass);
     }
 
+    // Write deobfuscation mapping: obf_name -> source_file
+    if(g_deobf_file && g_jvmti){
+        char* sf = nullptr;
+        if(g_jvmti->GetSourceFileName(klass, &sf) == JVMTI_ERROR_NONE && sf && sf[0]){
+            std::string src(sf);
+            if(src.size() > 5 && src.substr(src.size()-5) == ".java")
+                src = src.substr(0, src.size()-5);
+            if(src != dotname && src.find("$") == std::string::npos){
+                std::lock_guard<std::mutex> lk(g_mutex);
+                fprintf(g_deobf_file, "%-60s  ->  %s\n", dotname.c_str(), src.c_str());
+                fflush(g_deobf_file);
+            }
+            g_jvmti->Deallocate((unsigned char*)sf);
+        }
+    }
     {std::lock_guard<std::mutex> lk(g_mutex);
      printf("\n");
      if(g_file){ fprintf(g_file, "\n"); fflush(g_file); }
@@ -1201,12 +1213,14 @@ static std::vector<std::string> parse_crypto_strings(const std::vector<uint8_t>&
 
 static void write_crypto_entry(const std::string& class_path,
                                const std::vector<std::string>& strings,
-                               jclass klass){
+                               jclass /*klass*/){
+    // NOTE: Field/method info is already written to mappings_schema.txt by dump_class_schema.
+    // Do NOT repeat JNI reflection here — double reflection per class overflows local ref table → crash.
     if(!g_crypto_file) return;
     fprintf(g_crypto_file, "================================================================\n");
     fprintf(g_crypto_file, "[CLASS] %s\n", class_path.c_str());
 
-    // Print interesting constant pool strings
+    // Constant pool strings from .class file scan (populated by scan_classfiles_for_crypto)
     if(!strings.empty()){
         fprintf(g_crypto_file, "  Constant pool references:\n");
         std::set<std::string> seen;
@@ -1215,103 +1229,8 @@ static void write_crypto_entry(const std::string& class_path,
             seen.insert(s);
             fprintf(g_crypto_file, "    \"%s\"\n", s.c_str());
         }
-    }
-
-    if(klass && g_env){
-        JNIEnv* env = g_env;
-        // ── Fields via JNI reflection ──────────────────────────────────────
-        fprintf(g_crypto_file, "  Fields:\n");
-        if(g_jmid_getDeclaredFields){
-            jobject farr = env->CallObjectMethod(klass, g_jmid_getDeclaredFields);
-            env->ExceptionClear();
-            if(farr){
-                jint flen = env->GetArrayLength((jarray)farr);
-                env->ExceptionClear();
-                for(jint i=0;i<flen;i++){
-                    jobject fobj = env->GetObjectArrayElement((jobjectArray)farr, i);
-                    env->ExceptionClear();
-                    if(!fobj){continue;}
-                    // Field.getName()
-                    jstring fname_js = nullptr;
-                    if(g_jmid_getName) fname_js=(jstring)env->CallObjectMethod(fobj,g_jmid_getName);
-                    env->ExceptionClear();
-                    // Field.getType().getName()
-                    jstring ftype_js = nullptr;
-                    if(g_jmid_fldType){
-                        jobject ftype = env->CallObjectMethod(fobj, g_jmid_fldType);
-                        env->ExceptionClear();
-                        if(ftype && g_jmid_getName)
-                            ftype_js=(jstring)env->CallObjectMethod(ftype, g_jmid_getName);
-                        env->ExceptionClear();
-                        if(ftype) env->DeleteLocalRef(ftype);
-                    }
-                    std::string fn = fname_js ? jstr_to_std(env,fname_js) : "?";
-                    std::string ft = ftype_js ? jstr_to_std(env,ftype_js) : "?";
-                    fprintf(g_crypto_file,"    %-30s  %s\n", fn.c_str(), ft.c_str());
-                    if(fname_js) env->DeleteLocalRef(fname_js);
-                    if(ftype_js) env->DeleteLocalRef(ftype_js);
-                    env->DeleteLocalRef(fobj);
-                }
-                env->DeleteLocalRef(farr);
-            }
-        }
-        // ── Methods via JNI reflection ─────────────────────────────────────
-        fprintf(g_crypto_file, "  Methods:\n");
-        if(g_jmid_getDeclaredMethods){
-            jobject marr = env->CallObjectMethod(klass, g_jmid_getDeclaredMethods);
-            env->ExceptionClear();
-            if(marr){
-                jint mlen = env->GetArrayLength((jarray)marr);
-                env->ExceptionClear();
-                for(jint i=0;i<mlen;i++){
-                    jobject mobj = env->GetObjectArrayElement((jobjectArray)marr, i);
-                    env->ExceptionClear();
-                    if(!mobj) continue;
-                    jstring mname_js = nullptr;
-                    if(g_jmid_getName) mname_js=(jstring)env->CallObjectMethod(mobj,g_jmid_getName);
-                    env->ExceptionClear();
-                    jstring rtype_js = nullptr;
-                    if(g_jmid_mthRet){
-                        jobject rt = env->CallObjectMethod(mobj, g_jmid_mthRet);
-                        env->ExceptionClear();
-                        if(rt && g_jmid_getName) rtype_js=(jstring)env->CallObjectMethod(rt,g_jmid_getName);
-                        env->ExceptionClear();
-                        if(rt) env->DeleteLocalRef(rt);
-                    }
-                    // Parameter types
-                    std::string params;
-                    if(g_jmid_mthParams){
-                        jobject ptarr = env->CallObjectMethod(mobj, g_jmid_mthParams);
-                        env->ExceptionClear();
-                        if(ptarr){
-                            jint plen = env->GetArrayLength((jarray)ptarr);
-                            env->ExceptionClear();
-                            for(jint j=0;j<plen;j++){
-                                jobject pt = env->GetObjectArrayElement((jobjectArray)ptarr,j);
-                                env->ExceptionClear();
-                                if(pt){
-                                    if(!params.empty()) params+=", ";
-                                    if(g_jmid_getName){
-                                        jstring pn=(jstring)env->CallObjectMethod(pt,g_jmid_getName);
-                                        env->ExceptionClear();
-                                        if(pn){ params+=jstr_to_std(env,pn); env->DeleteLocalRef(pn); }
-                                    }
-                                    env->DeleteLocalRef(pt);
-                                }
-                            }
-                            env->DeleteLocalRef(ptarr);
-                        }
-                    }
-                    std::string mn = mname_js ? jstr_to_std(env,mname_js) : "?";
-                    std::string rt = rtype_js ? jstr_to_std(env,rtype_js) : "?";
-                    fprintf(g_crypto_file,"    %s(%s) -> %s\n", mn.c_str(), params.c_str(), rt.c_str());
-                    if(mname_js) env->DeleteLocalRef(mname_js);
-                    if(rtype_js) env->DeleteLocalRef(rtype_js);
-                    env->DeleteLocalRef(mobj);
-                }
-                env->DeleteLocalRef(marr);
-            }
-        }
+    } else {
+        fprintf(g_crypto_file, "  (see mappings_schema.txt for fields/methods)\n");
     }
     fprintf(g_crypto_file, "\n");
     fflush(g_crypto_file);
@@ -1446,14 +1365,25 @@ static void extract_jars_from_classpath(JNIEnv* /*hint_env*/){
             if(ename.size() > 6 && ename.substr(ename.size()-6) == ".class"){
                 std::string rel = ename;
                 for(char& c : rel) if(c == '/') c = '\\';
-                char fpath[MAX_PATH];
-                _snprintf_s(fpath, sizeof(fpath), "%s\\%s", g_class_dump_dir, rel.c_str());
 
-                if(!wfile_exists(fpath)){
+                // Build full path using wide-char directly to avoid ANSI/UTF-8 mixing
+                // g_class_dump_dir is ANSI (ASCII only), rel is UTF-8 (may contain Cyrillic)
+                // Combine as UTF-8: convert g_class_dump_dir to UTF-8 first (it's ASCII, same result)
+                std::string fpath_utf8 = std::string(g_class_dump_dir) + "\\" + rel;
+
+                if(!wfile_exists(fpath_utf8)){
                     jobject is = env->CallObjectMethod(zf, zip_stream, entry);
                     env->ExceptionClear();
                     if(is){
-                        FILE* out = wfopen_write(fpath);
+                        FILE* out = wfopen_write(fpath_utf8);
+                        if(!out && total == 0){
+                            // Log first failure for diagnosis
+                            std::wstring wp = utf8_to_wide(fpath_utf8);
+                            con_log(YELLOW, "[~] JAR write fail: %s\n", fpath_utf8.substr(0,80).c_str());
+                            // Try creating dirs manually then reopen
+                            make_dirs_for_w(wp);
+                            out = _wfopen(wp.c_str(), L"wb");
+                        }
                         jint nr;
                         while((nr = env->CallIntMethod(is, is_read, jbuf)) > 0){
                             env->ExceptionClear();
@@ -1464,6 +1394,8 @@ static void extract_jars_from_classpath(JNIEnv* /*hint_env*/){
                         if(out){ fclose(out); total++; }
                         if(is_close){ env->CallVoidMethod(is, is_close); env->ExceptionClear(); }
                         env->DeleteLocalRef(is);
+                    } else if(total == 0){
+                        con_log(YELLOW, "[~] JAR getInputStream null for: %s\n", ename.substr(0,60).c_str());
                     }
                 }
             }
@@ -1615,91 +1547,71 @@ static DWORD WINAPI class_monitor_thread(LPVOID){
 // Force-load all classes from classpath JARs so they appear in next snapshot
 // This catches craftrise/crsecond lazy-loaded classes
 static void force_load_all_jar_classes(JNIEnv* env){
-    if(!env || !g_jvmti) return;
-    con_log(CYAN, "[*] JAR sinif force-load baslatiliyor...\n");
+    // Only force-load craftrise.* and crsecond.* classes from extracted files.
+    // Loading all 25000 JAR classes crashes the JVM. We only need the Craftrise-specific ones.
+    if(!env || !g_jvmti || g_class_dump_dir[0] == '\0') return;
+    con_log(CYAN, "[*] Craftrise sinif force-load baslatiliyor...\n");
     int loaded = 0, failed = 0;
 
-    // Reuse classpath scanning logic
-    jclass sys_cls = env->FindClass("java/lang/System"); env->ExceptionClear();
-    if(!sys_cls) return;
-    jmethodID get_prop = env->GetStaticMethodID(sys_cls, "getProperty", "(Ljava/lang/String;)Ljava/lang/String;"); env->ExceptionClear();
-    if(!get_prop){ env->DeleteLocalRef(sys_cls); return; }
-    jstring key = env->NewStringUTF("java.class.path"); env->ExceptionClear();
-    jstring cp_str = (jstring)env->CallStaticObjectMethod(sys_cls, get_prop, key); env->ExceptionClear();
-    env->DeleteLocalRef(key); env->DeleteLocalRef(sys_cls);
-    if(!cp_str) return;
-    std::string classpath = jstr_to_std(env, cp_str); env->DeleteLocalRef(cp_str);
+    // g_class_dump_dir is ANSI — convert to wide for Unicode file names
+    wchar_t wbase[MAX_PATH];
+    MultiByteToWideChar(CP_ACP, 0, g_class_dump_dir, -1, wbase, MAX_PATH);
 
-    // Get ZipFile class and methods
-    jclass zip_cls = env->FindClass("java/util/zip/ZipFile"); env->ExceptionClear();
-    jmethodID zip_ctor=nullptr, zip_entries=nullptr, enum_has=nullptr, enum_next=nullptr, entry_name=nullptr, zip_close=nullptr;
-    if(zip_cls){
-        zip_ctor   = env->GetMethodID(zip_cls,"<init>","(Ljava/lang/String;)V"); env->ExceptionClear();
-        zip_entries= env->GetMethodID(zip_cls,"entries","()Ljava/util/Enumeration;"); env->ExceptionClear();
-        zip_close  = env->GetMethodID(zip_cls,"close","()V"); env->ExceptionClear();
-    }
-    jclass enum_cls = env->FindClass("java/util/Enumeration"); env->ExceptionClear();
-    if(enum_cls){
-        enum_has  = env->GetMethodID(enum_cls,"hasMoreElements","()Z"); env->ExceptionClear();
-        enum_next = env->GetMethodID(enum_cls,"nextElement","()Ljava/lang/Object;"); env->ExceptionClear();
-        env->DeleteLocalRef(enum_cls);
-    }
-    jclass ze_cls = env->FindClass("java/util/zip/ZipEntry"); env->ExceptionClear();
-    if(ze_cls){
-        entry_name = env->GetMethodID(ze_cls,"getName","()Ljava/lang/String;"); env->ExceptionClear();
-        env->DeleteLocalRef(ze_cls);
-    }
-    if(!zip_cls || !zip_ctor || !zip_entries || !enum_has || !enum_next || !entry_name){
-        if(zip_cls) env->DeleteLocalRef(zip_cls);
-        return;
-    }
+    const wchar_t* wtargets[] = { L"craftrise", L"crsecond", nullptr };
+    const char*     atargets[] = { "craftrise",  "crsecond",  nullptr };
 
-    // Parse classpath
-    std::vector<std::string> jars;
-    size_t s2=0;
-    for(size_t i=0;i<=classpath.size();i++){
-        if(i==classpath.size()||classpath[i]==';'){
-            std::string part=classpath.substr(s2,i-s2);
-            if(part.size()>4){
-                std::string lo=part; for(char& c:lo) c=(char)tolower((unsigned char)c);
-                if(lo.substr(lo.size()-4)==".jar") jars.push_back(part);
-            }
-            s2=i+1;
-        }
-    }
+    for(int ti = 0; wtargets[ti]; ti++){
+        wchar_t wpkgdir[MAX_PATH];
+        _snwprintf_s(wpkgdir, MAX_PATH, L"%s\\%s", wbase, wtargets[ti]);
 
-    for(const std::string& jpath : jars){
-        jstring jp = env->NewStringUTF(jpath.c_str()); env->ExceptionClear();
-        if(!jp) continue;
-        jobject zf = env->NewObject(zip_cls, zip_ctor, jp); env->ExceptionClear();
-        env->DeleteLocalRef(jp);
-        if(!zf) continue;
-        jobject enm = env->CallObjectMethod(zf, zip_entries); env->ExceptionClear();
-        while(enm && env->CallBooleanMethod(enm, enum_has)){
-            env->ExceptionClear();
-            jobject entry = env->CallObjectMethod(enm, enum_next); env->ExceptionClear();
-            if(!entry) break;
-            jstring jn = (jstring)env->CallObjectMethod(entry, entry_name); env->ExceptionClear();
-            if(jn){
-                std::string ename = jstr_to_std(env, jn); env->DeleteLocalRef(jn);
-                if(ename.size()>6 && ename.substr(ename.size()-6)==".class"){
-                    std::string slash_name = ename.substr(0, ename.size()-6);
-                    // FindClass forces JVM to load it
-                    jclass kls = env->FindClass(slash_name.c_str());
-                    env->ExceptionClear();
-                    if(kls){ loaded++; env->DeleteLocalRef(kls); }
-                    else failed++;
-                    if((loaded+failed) % 500 == 0) Sleep(5); // yield
+        // BFS over wide paths, collect UTF-8 relative class names
+        std::vector<std::wstring> dirs;
+        dirs.push_back(std::wstring(wpkgdir));
+        std::vector<std::string> to_process; // relative slash class names (UTF-8)
+
+        size_t wbase_len = wcslen(wbase);
+
+        while(!dirs.empty()){
+            std::wstring cur = dirs.back(); dirs.pop_back();
+            std::wstring pat = cur + L"\\*";
+            WIN32_FIND_DATAW fd;
+            HANDLE h = FindFirstFileW(pat.c_str(), &fd);
+            if(h == INVALID_HANDLE_VALUE) continue;
+            do {
+                if(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY){
+                    if(wcscmp(fd.cFileName, L".") != 0 && wcscmp(fd.cFileName, L"..") != 0)
+                        dirs.push_back(cur + L"\\" + fd.cFileName);
+                } else {
+                    std::wstring wfn(fd.cFileName);
+                    if(wfn.size() > 6 && wfn.substr(wfn.size()-6) == L".class"){
+                        std::wstring wfull = cur + L"\\" + wfn;
+                        // Strip wbase\ prefix → relative wide path
+                        std::wstring wrel = wfull.substr(wbase_len + 1); // +1 for backslash
+                        // Remove .class
+                        wrel = wrel.substr(0, wrel.size()-6);
+                        // Backslash → slash
+                        for(wchar_t& c : wrel) if(c == L'\\') c = L'/';
+                        // Convert to UTF-8 for FindClass
+                        char utf8[1024];
+                        int n = WideCharToMultiByte(CP_UTF8, 0, wrel.c_str(), -1, utf8, sizeof(utf8), nullptr, nullptr);
+                        if(n > 1) to_process.push_back(std::string(utf8));
+                    }
                 }
-            }
-            env->DeleteLocalRef(entry);
+            } while(FindNextFileW(h, &fd));
+            FindClose(h);
         }
-        if(enm) env->DeleteLocalRef(enm);
-        if(zip_close){ env->CallVoidMethod(zf, zip_close); env->ExceptionClear(); }
-        env->DeleteLocalRef(zf);
+
+        con_log(CYAN, "[*] %s: %d class bulundu\n", atargets[ti], (int)to_process.size());
+
+        for(const std::string& rel : to_process){
+            jclass kls = env->FindClass(rel.c_str());
+            env->ExceptionClear();
+            if(kls){ loaded++; env->DeleteLocalRef(kls); }
+            else failed++;
+            if((loaded + failed) % 50 == 0) Sleep(2);
+        }
     }
-    if(zip_cls) env->DeleteLocalRef(zip_cls);
-    con_log(CYAN, "[+] Force-load: %d yuklendi, %d yuklenemedi\n", loaded, failed);
+    con_log(CYAN, "[+] Force-load tamam: %d yuklendi, %d yuklenemedi\n", loaded, failed);
 }
 
 
@@ -1803,6 +1715,17 @@ static void initialize_and_dump(JNIEnv* env){
             con_log(GREEN, "[+] Crypto dosya: %s\n", cry_path);
         }
     }
+    {
+        char dob_path[MAX_PATH] = {};
+        _snprintf_s(dob_path, sizeof(dob_path), "%s\\mappings_deobf.txt", g_outdir);
+        g_deobf_file = _fsopen(dob_path, "w", _SH_DENYNO);
+        if(g_deobf_file){
+            fprintf(g_deobf_file, "# CRNativeDumper -- Deobfuscation Mappings --By cmmdx256\n");
+            fprintf(g_deobf_file, "# Format: obfuscated_class -> SourceFile (from debug info)\n");
+            fprintf(g_deobf_file, "# Note: obfuscated classes without debug info won't appear here\n\n");
+            con_log(GREEN, "[+] Deobf dosya: %s\n", dob_path);
+        }
+    }
     printf("\n");
 
     if(cap_err == JVMTI_ERROR_NONE){
@@ -1812,61 +1735,45 @@ static void initialize_and_dump(JNIEnv* env){
         con_log(WHITE, "[*] ClassFileLoadHook aktif\n\n");
     }
 
-    // Round 0: initial dump — classes loaded at startup
+    // ── Round 0: initial snapshot (startup classes) ─────────────────────────
     do_snapshot(0);
 
-    // JAR extraction in parallel (non-blocking)
-    CreateThread(nullptr, 0, [](LPVOID) -> DWORD {
-        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
-        extract_jars_from_classpath(g_env);
-        scan_classfiles_for_crypto();
-        return 0;
-    }, nullptr, 0, nullptr);
-
-    // Multi-round snapshot thread: catches lazy-loaded + server-join classes
-    CreateThread(nullptr, 0, [](LPVOID) -> DWORD {
-        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
-        JavaVMAttachArgs att = {JNI_VERSION_1_8, (char*)"CRDumper-Rounds", nullptr};
-        JNIEnv* renv = nullptr; bool att2 = false;
-        if(g_jvm->GetEnv((void**)&renv, JNI_VERSION_1_8) == JNI_EDETACHED)
-            if(g_jvm->AttachCurrentThread((void**)&renv, &att) == JNI_OK) att2 = true;
-        if(!renv){ if(att2) g_jvm->DetachCurrentThread(); return 0; }
-
-        // Round 1: 45s — after main menu loads
-        Sleep(45000);
-        con_log(CYAN, "[*] Round 1 baslatiliyor (45s)...\n");
-        do_snapshot(1);
-
-        // Round 2: force-load + 120s — after server join
-        Sleep(75000); // total 120s
-        con_log(CYAN, "[*] Round 2 — force-load + snapshot (120s)...\n");
-        force_load_all_jar_classes(renv);
-        Sleep(3000);
-        do_snapshot(2);
-
-        // Round 3: 300s — all lazy initialized classes
-        Sleep(180000); // total 300s
-        con_log(CYAN, "[*] Round 3 — final snapshot (300s)...\n");
-        do_snapshot(3);
-        if(g_file)    { fprintf(g_file,     "\n[~] Tum roundlar tamamlandi\n"); fflush(g_file); }
-
-        if(att2) g_jvm->DetachCurrentThread();
-        return 0;
-    }, nullptr, 0, nullptr);
-
-    CreateThread(nullptr, 0, class_monitor_thread, nullptr, 0, nullptr);
-
-    con_log(GREEN, "\n--By cmmdx256\n\n");
-    if(g_file)    { fprintf(g_file,     "\n--By cmmdx256\n"); fflush(g_file); }
-    if(g_fmt_file){ fprintf(g_fmt_file, "\n--By cmmdx256\n"); fflush(g_fmt_file); }
-    if(g_dbg)     { fprintf(g_dbg,      "\n--By cmmdx256\n"); fflush(g_dbg); }
-    if(g_net_file){ fprintf(g_net_file, "\n--By cmmdx256\n"); fflush(g_net_file); }
-    if(g_schema_file){ fprintf(g_schema_file, "\n--By cmmdx256\n"); fflush(g_schema_file); }
-    if(g_crypto_file){ fprintf(g_crypto_file, "\n-- END --By cmmdx256\n"); fflush(g_crypto_file); }
+    // ── JAR extraction (sequential — AC blocks AttachCurrentThread on new threads) ─
+    extract_jars_from_classpath(env);
+    scan_classfiles_for_crypto();
 
     g_dump_done.store(true);
-    con_log(WHITE, "[*] Dump tamamlandi. Hook canli.\n");
+    con_log(WHITE, "[*] Round 0 tamamlandi. Hook canli. Roundlar devam ediyor...\n");
+
+    // ── Round 1: 45s — after main menu loads ─────────────────────────────────
+    con_log(CYAN, "[*] Round 1 icin bekleniyor (45s)...\n");
+    Sleep(45000);
+    con_log(CYAN, "[*] Round 1 baslatiliyor...\n");
+    do_snapshot(1);
+
+    // ── Round 2: 120s — force-load all JAR classes + snapshot ─────────────────
+    con_log(CYAN, "[*] Round 2 icin bekleniyor (75s)...\n");
+    Sleep(75000);
+    con_log(CYAN, "[*] Round 2 — force-load + snapshot...\n");
+    force_load_all_jar_classes(env);
+    Sleep(3000);
+    do_snapshot(2);
+    extract_jars_from_classpath(env);
+    scan_classfiles_for_crypto();
+
+    if(g_file){ fprintf(g_file, "\n[~] Round 2 tamamlandi\n"); fflush(g_file); }
+
+
+    con_log(GREEN, "\n--By cmmdx256 Dump tamamlandi.\n\n");
+    if(g_file)     { fprintf(g_file,      "\n--By cmmdx256\n"); fflush(g_file); }
+    if(g_fmt_file) { fprintf(g_fmt_file,  "\n--By cmmdx256\n"); fflush(g_fmt_file); }
+    if(g_dbg)      { fprintf(g_dbg,       "\n--By cmmdx256\n"); fflush(g_dbg); }
+    if(g_net_file) { fprintf(g_net_file,  "\n--By cmmdx256\n"); fflush(g_net_file); }
+    if(g_schema_file){ fprintf(g_schema_file,"\n--By cmmdx256\n"); fflush(g_schema_file); }
+    if(g_crypto_file){ fprintf(g_crypto_file,"\n-- END --By cmmdx256\n"); fflush(g_crypto_file); }
+    if(g_deobf_file) { fprintf(g_deobf_file, "\n-- END --By cmmdx256\n"); fflush(g_deobf_file); }
 }
+
 
 static HMODULE g_hJvm = nullptr;
 static std::atomic<bool> g_init_started{false};
