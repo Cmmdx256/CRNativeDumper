@@ -148,18 +148,81 @@ int main(int argc, char* argv[]){
     printf("[+] craftrise-x64.exe bulundu — PID: %lu\n", pid);
     printf("[*] Pencere bekleniyor...\n");
 
+    // ── Step 1: wait for window ────────────────────────────────────────────
     int win_tick = 0;
     while(!process_has_window(pid)){
         Sleep(500);
         if(++win_tick % 10 == 0)
             printf("[~] Pencere bekleniyor... (%ds)\n", win_tick / 2);
-        // Re-check PID still alive
-        if(find_pid(L"craftrise-x64.exe") == 0){
-            printf("[!] Craftrise kapandi.\n");
-            return 1;
-        }
+        if(find_pid(L"craftrise-x64.exe") == 0){ printf("[!] Craftrise kapandi.\n"); return 1; }
     }
-    printf("[+] Pencere geldi — inject ediliyor...\n");
+    printf("[+] Pencere geldi.\n");
+    printf("[*] Oyun tam yuklenene kadar bekleniyor (CPU izleniyor)...\n");
+
+    // ── Step 2: CPU-based full-load detection ──────────────────────────────
+    // Open process handle for CPU monitoring
+    HANDLE hMonProc = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, pid);
+    if(hMonProc){
+        FILETIME ft_idle, ft_kern, ft_user;
+        FILETIME pt_create, pt_exit, pt_kern0, pt_user0;
+        GetSystemTimes(&ft_idle, &ft_kern, &ft_user);
+        GetProcessTimes(hMonProc, &pt_create, &pt_exit, &pt_kern0, &pt_user0);
+
+        auto ft_to_u64 = [](FILETIME ft) -> ULONGLONG {
+            return ((ULONGLONG)ft.dwHighDateTime << 32) | ft.dwLowDateTime;
+        };
+
+        int low_cpu_streak = 0;
+        int load_tick = 0;
+        const int MIN_WAIT_TICKS = 10; // minimum 5s after window before we start checking
+
+        while(low_cpu_streak < 3){
+            Sleep(500);
+            load_tick++;
+
+            // Check process still alive
+            if(find_pid(L"craftrise-x64.exe") == 0){
+                printf("[!] Craftrise kapandi.\n");
+                CloseHandle(hMonProc);
+                return 1;
+            }
+
+            if(load_tick < MIN_WAIT_TICKS){ continue; } // enforce minimum wait
+
+            // Sample CPU
+            FILETIME sys_idle2, sys_kern2, sys_user2;
+            FILETIME pt_c2, pt_e2, pt_k2, pt_u2;
+            GetSystemTimes(&sys_idle2, &sys_kern2, &sys_user2);
+            GetProcessTimes(hMonProc, &pt_c2, &pt_e2, &pt_k2, &pt_u2);
+
+            ULONGLONG sys_elapsed = (ft_to_u64(sys_kern2) + ft_to_u64(sys_user2))
+                                  - (ft_to_u64(ft_kern)   + ft_to_u64(ft_user));
+            ULONGLONG proc_elapsed = (ft_to_u64(pt_k2) + ft_to_u64(pt_u2))
+                                   - (ft_to_u64(pt_kern0) + ft_to_u64(pt_user0));
+
+            // Update baseline
+            ft_kern = sys_kern2; ft_user = sys_user2;
+            pt_kern0 = pt_k2;    pt_user0 = pt_u2;
+
+            double cpu_pct = sys_elapsed > 0 ? (100.0 * proc_elapsed / sys_elapsed) : 100.0;
+
+            if(load_tick % 4 == 0)
+                printf("[~] CPU: %.1f%%  (yükleniyor...)\n", cpu_pct);
+
+            if(cpu_pct < 15.0) low_cpu_streak++;
+            else                low_cpu_streak = 0;
+        }
+        CloseHandle(hMonProc);
+        printf("[+] Oyun yuklemesi tamamlandi (CPU dusuk) — inject ediliyor...\n");
+    } else {
+        // Fallback: just wait 8 seconds
+        printf("[~] CPU izleme basarisiz — 8s bekleniyor...\n");
+        for(int i=8;i>0;i--){
+            printf("[~] %ds...\n",i); Sleep(1000);
+            if(find_pid(L"craftrise-x64.exe")==0){ printf("[!] Craftrise kapandi.\n"); return 1; }
+        }
+        printf("[+] Inject ediliyor...\n");
+    }
 
     if(!inject(pid, dll_path)) return 1;
 

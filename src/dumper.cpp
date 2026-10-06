@@ -1326,10 +1326,14 @@ static void extract_jars_from_classpath(JNIEnv* /*hint_env*/){
     JavaVMAttachArgs att = {JNI_VERSION_1_8, (char*)"CRDumper-Extract", nullptr};
     bool we_attached = false;
     jint att_rc = g_jvm->GetEnv((void**)&env, JNI_VERSION_1_8);
-    if(att_rc == JNI_EDETACHED){
-        if(g_jvm->AttachCurrentThread((void**)&env, &att) == JNI_OK) we_attached = true;
+    // att_rc == JNI_OK: already attached (env set). JNI_EDETACHED: need attach. Other: try anyway.
+    if(att_rc != JNI_OK || !env){
+        jint ar2 = g_jvm->AttachCurrentThread((void**)&env, &att);
+        if(ar2 == JNI_OK && env) we_attached = true;
+        else con_log(YELLOW, "[~] extract: AttachCurrentThread rc=%d env=%p (GetEnv rc=%d)\n", ar2, (void*)env, att_rc);
     }
-    if(!env){ con_log(RED, "[!] extract: JNIEnv alinamadi\n"); return; }
+    if(!env){ con_log(RED, "[!] extract: JNIEnv alinamadi (GetEnv=%d)\n", att_rc); return; }
+    con_log(CYAN, "[*] JAR extract env=%p (we_attached=%d)\n", (void*)env, (int)we_attached);
 
     jclass sys_cls = env->FindClass("java/lang/System");
     env->ExceptionClear();
